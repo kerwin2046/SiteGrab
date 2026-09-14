@@ -34,6 +34,7 @@ pub struct CapturedResource {
 }
 
 /// Result of rendering one URL.
+#[derive(Clone)]
 pub struct RenderResult {
     /// Fully rendered HTML (post-JS execution) — what you'd see in DevTools.
     pub html: String,

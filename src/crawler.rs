@@ -1396,7 +1396,9 @@ mod spa {
 
         // Launch headless browser.
         eprintln!("info: Launching headless browser for SPA rendering...");
-        let (browser, mut handler) = renderer::launch_browser_async(no_sandbox).await?;
+        let browser_raw = renderer::launch_browser_async(no_sandbox).await?;
+        let browser = Arc::new(browser_raw.0);
+        let mut handler = browser_raw.1;
         let _handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
         // robots.txt
@@ -1436,7 +1438,7 @@ mod spa {
         // Semaphore for asset downloads.
         let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
 
-        while let Some(route) = queue.pop_front() {
+        while !queue.is_empty() {
             if limits.reached(&stats) {
                 eprintln!(
                     "info: crawl limit reached (max_pages={}, max_bytes={}) — stopping SPA crawl",
@@ -1445,42 +1447,88 @@ mod spa {
                 break;
             }
 
-            // robots.txt check for this route
-            if let Some(ref r) = robots {
-                if !r.is_allowed(route.path()) {
-                    eprintln!("  🚫 robots.txt: skipped {}", route);
-                    continue;
+            // Build a batch of routes to render concurrently. Routes that can
+            // be served from a fresh local copy are reused without rendering.
+            let batch_capacity = concurrency.max(1);
+            let mut batch: Vec<Url> = Vec::new();
+            while let Some(route) = queue.pop_front() {
+                if batch.len() >= batch_capacity {
+                    queue.push_front(route);
+                    break;
                 }
-            }
 
-            // Incremental: reuse fresh rendered HTML without re-launching Chrome.
-            let page_prior = if let Some(ref mf) = manifest {
-                let mf = mf.lock().await;
-                prior_from_manifest(&mf, route.as_str(), &out_dir)
-            } else {
-                None
-            };
-            if let Some(ref p) = page_prior {
-                if p.local_fresh {
-                    if let Ok(pr) = reuse_local(&route, &out_dir, &host_norm, base_port, p).await {
-                        stats.record(ResourceType::Page, 0);
-                        for link in pr.new_urls {
-                            let norm = normalize_url(&link, &host_norm, ResourceType::Page);
-                            if visited.insert(norm.clone())
-                                && is_enqueueable_page(&norm, &host_norm)
-                            {
-                                queue.push_back(norm);
-                            }
-                        }
+                // robots.txt check for this route
+                if let Some(ref r) = robots {
+                    if !r.is_allowed(route.path()) {
+                        eprintln!("  🚫 robots.txt: skipped {}", route);
                         continue;
                     }
                 }
+
+                // Incremental: reuse fresh rendered HTML without re-rendering.
+                let page_prior = if let Some(ref mf) = manifest {
+                    let mf = mf.lock().await;
+                    prior_from_manifest(&mf, route.as_str(), &out_dir)
+                } else {
+                    None
+                };
+                if let Some(ref p) = page_prior {
+                    if p.local_fresh {
+                        if let Ok(pr) =
+                            reuse_local(&route, &out_dir, &host_norm, base_port, p).await
+                        {
+                            stats.record(ResourceType::Page, 0);
+                            for link in pr.new_urls {
+                                let norm = normalize_url(&link, &host_norm, ResourceType::Page);
+                                if visited.insert(norm.clone())
+                                    && is_enqueueable_page(&norm, &host_norm)
+                                {
+                                    queue.push_back(norm);
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                batch.push(route);
             }
 
-            pb.set_message(format!("Rendering {}", route));
-            let render =
-                match renderer::render_page(&browser, &route, &host_norm, base_port, wait_ms).await
-                {
+            if batch.is_empty() {
+                continue;
+            }
+
+            pb.set_message(format!(
+                "Rendering {} route{}",
+                batch.len(),
+                if batch.len() == 1 { "" } else { "s" }
+            ));
+
+            // Render the batch concurrently (one Chrome tab per route).
+            let render_sem = Arc::new(Semaphore::new(batch_capacity));
+            let mut render_set: JoinSet<(Url, Result<renderer::RenderResult>)> = JoinSet::new();
+            for route in batch {
+                let permit = render_sem.clone().acquire_owned().await.unwrap();
+                let b = Arc::clone(&browser);
+                let wait = wait_ms;
+                let h = host_norm.clone();
+                render_set.spawn(async move {
+                    let r = renderer::render_page(&b, &route, &h, base_port, wait).await;
+                    drop(permit);
+                    (route, r)
+                });
+            }
+
+            while let Some(joined) = render_set.join_next().await {
+                let (route, render_res) = match joined {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("  ⚡ render task failed: {e}");
+                        stats.record_err();
+                        continue;
+                    }
+                };
+                let render = match render_res {
                     Ok(r) => r,
                     Err(e) => {
                         eprintln!("  ⚠ render failed for {route}: {e}");
@@ -1489,98 +1537,99 @@ mod spa {
                     }
                 };
 
-            // --- Save the rendered HTML ---
-            let page_url = &render.final_url;
-            // Strip <script> tags so the framework doesn't re-hydrate and
-            // wipe the DOM when API calls fail offline.
-            let stripped = crate::rewriter::strip_scripts(&render.html);
-            let rewritten =
-                crate::rewriter::rewrite_html(&stripped, page_url, &host_norm, base_port);
+                // --- Save the rendered HTML ---
+                let page_url = &render.final_url;
+                // Strip <script> tags so the framework doesn't re-hydrate and
+                // wipe the DOM when API calls fail offline.
+                let stripped = crate::rewriter::strip_scripts(&render.html);
+                let rewritten =
+                    crate::rewriter::rewrite_html(&stripped, page_url, &host_norm, base_port);
 
-            let save_path = url_to_path(
-                page_url,
-                &out_dir,
-                &host_norm,
-                base_port,
-                ResourceType::Page,
-            );
-            let save_path_rel = save_path
-                .strip_prefix(&out_dir)
-                .unwrap_or(&save_path)
-                .to_string_lossy()
-                .trim_start_matches('/')
-                .to_string();
+                let save_path = url_to_path(
+                    page_url,
+                    &out_dir,
+                    &host_norm,
+                    base_port,
+                    ResourceType::Page,
+                );
+                let save_path_rel = save_path
+                    .strip_prefix(&out_dir)
+                    .unwrap_or(&save_path)
+                    .to_string_lossy()
+                    .trim_start_matches('/')
+                    .to_string();
 
-            if let Some(parent) = save_path.parent() {
-                if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                    eprintln!("  ⚠ mkdir failed: {e}");
+                if let Some(parent) = save_path.parent() {
+                    if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                        eprintln!("  ⚠ mkdir failed: {e}");
+                    }
                 }
-            }
-            let html_bytes = rewritten.into_bytes();
-            let page_outlinks: Vec<String> = render
-                .links
-                .iter()
-                .map(|u| {
-                    normalize_url(u, &host_norm, ResourceType::Page)
-                        .as_str()
-                        .to_string()
-                })
-                .collect();
-            if let Err(e) = tokio::fs::write(&save_path, &html_bytes).await {
-                eprintln!("  ⚠ write failed for {}: {e}", save_path.display());
-                stats.record_err();
-            } else {
-                stats.record(ResourceType::Page, html_bytes.len() as u64);
+                let html_bytes = rewritten.into_bytes();
+                let page_outlinks: Vec<String> = render
+                    .links
+                    .iter()
+                    .map(|u| {
+                        normalize_url(u, &host_norm, ResourceType::Page)
+                            .as_str()
+                            .to_string()
+                    })
+                    .collect();
+                if let Err(e) = tokio::fs::write(&save_path, &html_bytes).await {
+                    eprintln!("  ⚠ write failed for {}: {e}", save_path.display());
+                    stats.record_err();
+                } else {
+                    stats.record(ResourceType::Page, html_bytes.len() as u64);
 
-                if let Some(ref mf) = manifest {
-                    let mut mf = mf.lock().await;
-                    let norm = normalize_url(page_url, &host_norm, ResourceType::Page);
-                    mf.record_with_meta(
-                        norm.as_str().to_string(),
-                        if page_url.as_str() != norm.as_str() {
-                            Some(page_url.as_str().to_string())
-                        } else {
-                            None
-                        },
-                        save_path_rel.clone(),
-                        &html_bytes,
-                        None,
-                        None,
-                        "page",
-                        &page_outlinks,
-                    );
-                }
-            }
-
-            let mut assets: Vec<Url> = Vec::new();
-            for cap in &render.resources {
-                let asset_url = &cap.url;
-                let asset_rtype = classify_by_ext(asset_url.path());
-                let norm = normalize_url(asset_url, &host_norm, asset_rtype);
-
-                if is_spa_document_url(&norm, &route, page_url, &host_norm) {
-                    continue;
+                    if let Some(ref mf) = manifest {
+                        let mut mf = mf.lock().await;
+                        let norm = normalize_url(page_url, &host_norm, ResourceType::Page);
+                        mf.record_with_meta(
+                            norm.as_str().to_string(),
+                            if page_url.as_str() != norm.as_str() {
+                                Some(page_url.as_str().to_string())
+                            } else {
+                                None
+                            },
+                            save_path_rel.clone(),
+                            &html_bytes,
+                            None,
+                            None,
+                            "page",
+                            &page_outlinks,
+                        );
+                    }
                 }
 
-                if pathmap::is_dynamic_request(&norm) {
-                    continue;
+                let mut assets: Vec<Url> = Vec::new();
+                for cap in &render.resources {
+                    let asset_url = &cap.url;
+                    let asset_rtype = classify_by_ext(asset_url.path());
+                    let norm = normalize_url(asset_url, &host_norm, asset_rtype);
+
+                    if is_spa_document_url(&norm, &route, page_url, &host_norm) {
+                        continue;
+                    }
+
+                    if pathmap::is_dynamic_request(&norm) {
+                        continue;
+                    }
+
+                    if done_assets.insert(norm.clone()) {
+                        assets.push(norm);
+                    }
                 }
 
-                if done_assets.insert(norm.clone()) {
-                    assets.push(norm);
-                }
-            }
+                download_assets(
+                    &assets, &client, &out_dir, &host_norm, base_port, &pb, &stats, &semaphore,
+                    &manifest,
+                )
+                .await;
 
-            download_assets(
-                &assets, &client, &out_dir, &host_norm, base_port, &pb, &stats, &semaphore,
-                &manifest,
-            )
-            .await;
-
-            for link in &render.links {
-                let norm = normalize_url(link, &host_norm, ResourceType::Page);
-                if visited.insert(norm.clone()) && is_enqueueable_page(&norm, &host_norm) {
-                    queue.push_back(norm);
+                for link in &render.links {
+                    let norm = normalize_url(link, &host_norm, ResourceType::Page);
+                    if visited.insert(norm.clone()) && is_enqueueable_page(&norm, &host_norm) {
+                        queue.push_back(norm);
+                    }
                 }
             }
         }
