@@ -470,7 +470,7 @@ mod tests {
     fn test_cross_port_external_path() {
         let asset = Url::parse("http://127.0.0.1:2222/roboto.woff2").unwrap();
         let path = url_to_path_with(&asset, "out", "127.0.0.1", Some(1111), UrlKind::Asset);
-        let s = path.to_string_lossy();
+        let s = path.to_string_lossy().replace('\\', "/");
         assert!(
             s.contains("_external/127.0.0.1_2222"),
             "unexpected path: {s}"

@@ -84,7 +84,27 @@ fn attr_regex() -> &'static Regex {
 
 fn srcset_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r#"(?i)(\s+srcset\s*=\s*)(?:"([^"]*?)"|'([^']*?)')"#).unwrap())
+    RE.get_or_init(|| {
+        // Match both srcset and data-srcset (lazy-loaded responsive images).
+        Regex::new(r#"(?i)(\s+(?:srcset|data-srcset)\s*=\s*)(?:\"([^\"]*?)\"|'([^']*?)')"#).unwrap()
+    })
+}
+
+fn style_attr_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#"(?i)(\s+style\s*=\s*)\"([^\"]*?)\""#).unwrap())
+}
+
+fn meta_refresh_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // `<meta http-equiv="refresh" content="0;url=...">` — unrewritten,
+        // they bounce offline readers back to the live site.
+        Regex::new(
+            r#"(?is)<meta\b[^>]*?\bhttp-equiv\s*=\s*[\"']refresh[\"'][^>]*?\bcontent\s*=\s*[\"']([^\"']*)[\"'][^>]*?>"#,
+        )
+        .unwrap()
+    })
 }
 
 fn base_tag_regex() -> &'static Regex {
@@ -109,17 +129,51 @@ fn extract_base_href(html: &str, page_url: &Url) -> Option<Url> {
 }
 
 #[cfg(feature = "render")]
+#[cfg(feature = "render")]
 fn script_tag_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?si)<script[^>]*>.*?</script>").unwrap())
+    RE.get_or_init(|| Regex::new(r"(?si)<script\b[^>]*>.*?</script>").unwrap())
 }
 
+/// Check whether a `<script ...>` opening tag is a data/non-executable
+/// script that should be kept in the offline copy (structured data,
+/// templates, speculation rules).
+#[cfg(feature = "render")]
+fn is_data_script(open_tag: &str) -> bool {
+    let re = regex::Regex::new(
+        r#"(?i)\btype\s*=\s*[\"'](?:application/ld\+json|text/template|speculationrules|application/json)[\"']"#,
+    );
+    match re {
+        Ok(re) => re.is_match(open_tag),
+        Err(_) => false,
+    }
+}
+
+/// Remove executable `<script>` tags from HTML. This is used for SPA pages
+/// so the framework doesn't re-hydrate and wipe the DOM when API calls fail
+/// offline. Data scripts (JSON-LD, templates) are kept.
 #[cfg(feature = "render")]
 pub fn strip_scripts(html: &str) -> String {
     if !html.to_lowercase().contains("<script") {
         return html.to_string();
     }
-    script_tag_regex().replace_all(html, "").to_string()
+    let re = script_tag_regex();
+    let mut result = String::with_capacity(html.len());
+    let mut last_end = 0;
+    for m in re.find_iter(html) {
+        let open_tag_end = html[m.start()..m.end()]
+            .find('>')
+            .map(|i| m.start() + i)
+            .unwrap_or(m.start());
+        let open_tag = &html[m.start()..open_tag_end];
+        if is_data_script(open_tag) {
+            continue;
+        }
+        result.push_str(&html[last_end..m.start()]);
+        last_end = m.end();
+    }
+    result.push_str(&html[last_end..]);
+    result
 }
 
 fn split_fragment(value: &str) -> (String, Option<String>) {
@@ -187,6 +241,7 @@ pub fn rewrite_html(html: &str, page_url: &Url, base_host: &str, base_port: Opti
         && !html.contains("src=")
         && !html.contains("srcset=")
         && !html.contains("data-src")
+        && !html.contains("style=")
     {
         return strip_offline_breakers(html.to_string());
     }
@@ -199,15 +254,23 @@ pub fn rewrite_html(html: &str, page_url: &Url, base_host: &str, base_port: Opti
 
     let attr_re = attr_regex();
     let srcset_re = srcset_regex();
+    let style_re = style_attr_regex();
 
     let mut result = String::with_capacity(html.len() + 4096);
     let mut last_end = 0;
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum SpanKind {
+        Attr,
+        Srcset,
+        Style,
+    }
 
     #[derive(Clone, Copy)]
     struct Span {
         start: usize,
         end: usize,
-        is_srcset: bool,
+        kind: SpanKind,
     }
 
     let mut spans: Vec<Span> = Vec::new();
@@ -215,14 +278,21 @@ pub fn rewrite_html(html: &str, page_url: &Url, base_host: &str, base_port: Opti
         spans.push(Span {
             start: m.start(),
             end: m.end(),
-            is_srcset: false,
+            kind: SpanKind::Attr,
         });
     }
     for m in srcset_re.find_iter(html) {
         spans.push(Span {
             start: m.start(),
             end: m.end(),
-            is_srcset: true,
+            kind: SpanKind::Srcset,
+        });
+    }
+    for m in style_re.find_iter(html) {
+        spans.push(Span {
+            start: m.start(),
+            end: m.end(),
+            kind: SpanKind::Style,
         });
     }
     spans.sort_by_key(|s| s.start);
@@ -231,39 +301,38 @@ pub fn rewrite_html(html: &str, page_url: &Url, base_host: &str, base_port: Opti
         result.push_str(&html[last_end..span.start]);
         let matched = &html[span.start..span.end];
 
-        if span.is_srcset {
-            if let Some(caps) = srcset_re.captures(matched) {
-                let attr_prefix = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                let value = caps
-                    .get(2)
-                    .or_else(|| caps.get(3))
-                    .map(|m| m.as_str())
-                    .unwrap_or("");
+        let eq_pos = matched.find('=').unwrap();
+        let attr_prefix = matched[..eq_pos].trim_end();
+        let rest = &matched[eq_pos + 1..];
+        let value = &rest[1..rest.len() - 1];
+
+        match span.kind {
+            SpanKind::Srcset => {
                 if let Some(nv) = rewrite_srcset(value, &base_url, &page_path, base_host, base_port)
                 {
-                    result.push_str(&format!("{}\"{}\"", attr_prefix.trim_end(), nv));
+                    result.push_str(&format!("{}=\"{}\"", attr_prefix, nv));
                 } else {
                     result.push_str(matched);
                 }
-            } else {
-                result.push_str(matched);
             }
-        } else if let Some(caps) = attr_re.captures(matched) {
-            let attr_prefix = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            let value = caps
-                .get(2)
-                .or_else(|| caps.get(3))
-                .map(|m| m.as_str())
-                .unwrap_or("");
-            if let Some(new_path) =
-                rewrite_url_value(value, &base_url, &page_path, base_host, base_port)
-            {
-                result.push_str(&format!("{}\"{}\"", attr_prefix.trim_end(), new_path));
-            } else {
-                result.push_str(matched);
+            SpanKind::Style => {
+                if let Some(nv) =
+                    rewrite_inline_style(value, &base_url, &page_path, base_host, base_port)
+                {
+                    result.push_str(&format!("{}=\"{}\"", attr_prefix, nv));
+                } else {
+                    result.push_str(matched);
+                }
             }
-        } else {
-            result.push_str(matched);
+            SpanKind::Attr => {
+                if let Some(new_path) =
+                    rewrite_url_value(value, &base_url, &page_path, base_host, base_port)
+                {
+                    result.push_str(&format!("{}=\"{}\"", attr_prefix, new_path));
+                } else {
+                    result.push_str(matched);
+                }
+            }
         }
 
         last_end = span.end;
@@ -327,6 +396,12 @@ fn strip_offline_breakers(html: String) -> String {
     let after_re = modulepreload_re.replace_all(&after_re, "");
     let after_re = script_preload_re.replace_all(&after_re, "");
 
+    // Remove <meta http-equiv="refresh"> tags — they bounce offline readers
+    // back to the live site. Same-site targets are mirrored as pages and
+    // linked normally, so dropping the tag is lossless for site-internal
+    // redirects; external targets must not be followed offline.
+    let after_re = meta_refresh_regex().replace_all(&after_re, "");
+
     let mut result = String::with_capacity(after_re.len());
     let mut last_end = 0;
     for cap in sw_inline_re.captures_iter(&after_re) {
@@ -387,6 +462,46 @@ fn rewrite_srcset(
 
     if changed {
         Some(rewritten_parts.join(", "))
+    } else {
+        None
+    }
+}
+
+/// Rewrite `url(...)` references inside an inline `style="..."` attribute.
+fn rewrite_inline_style(
+    value: &str,
+    base_url: &Url,
+    page_path: &str,
+    base_host: &str,
+    base_port: Option<u16>,
+) -> Option<String> {
+    let re = css_url_regex();
+    let mut changed = false;
+    let mut result = String::with_capacity(value.len());
+
+    let mut last_end = 0;
+    for cap in re.captures_iter(value) {
+        let m = match cap.get(0) {
+            Some(m) => m,
+            None => continue,
+        };
+        let url_text = cap.get(1).map(|u| u.as_str()).unwrap_or("");
+        if url_text.starts_with("data:") {
+            continue;
+        }
+        if let Some(new_path) =
+            rewrite_url_value(url_text, base_url, page_path, base_host, base_port)
+        {
+            result.push_str(&value[last_end..m.start()]);
+            result.push_str(&format!("url({})", new_path));
+            changed = true;
+            last_end = m.end();
+        }
+    }
+    result.push_str(&value[last_end..]);
+
+    if changed {
+        Some(result)
     } else {
         None
     }

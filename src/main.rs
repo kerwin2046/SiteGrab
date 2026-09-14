@@ -1,10 +1,20 @@
 use std::process;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use sitegrab::crawler;
 use sitegrab::manifest;
 use sitegrab::offline;
 use url::Url;
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum RenderMode {
+    /// Detect whether the site is a SPA and render only if needed
+    Auto,
+    /// Force headless-browser rendering for every page
+    On,
+    /// Plain HTTP crawling only
+    Off,
+}
 
 #[derive(Parser)]
 #[command(
@@ -30,9 +40,9 @@ struct Args {
     #[arg(short, long)]
     output: Option<String>,
 
-    /// Number of concurrent downloads
-    #[arg(short, long, default_value = "8")]
-    jobs: usize,
+    /// Number of concurrent downloads (must be >= 1)
+    #[arg(short, long, default_value = "8", value_parser = clap::value_parser!(u16).range(1..))]
+    jobs: u16,
 
     /// Skip ZIP archive creation
     #[arg(long)]
@@ -50,8 +60,8 @@ struct Args {
     /// "auto" detects whether the site is a SPA and renders if needed.
     /// "on" forces headless-browser rendering for every page.
     /// "off" uses plain HTTP crawling only.
-    #[arg(long, default_value = "auto")]
-    render: String,
+    #[arg(long, default_value = "auto", value_enum)]
+    render: RenderMode,
 
     /// Settle time (ms) to wait after page load for lazy/AJAX content.
     /// Only relevant when rendering is active. Default: 1500
@@ -99,38 +109,23 @@ async fn main() {
 
     let output_dir = args.output.unwrap_or_else(|| host.clone());
 
-    if args.jobs < 1 {
-        eprintln!("error: --jobs must be at least 1");
-        process::exit(1);
-    }
-    if args.max_pages < 1 {
-        eprintln!("error: --max-pages must be at least 1");
-        process::exit(1);
-    }
-
-    // Normalise render option: "auto" (default) detects SPA automatically,
-    // "on"/"yes" forces render, "off"/"no" forces plain HTTP crawl.
-    let render_opt = args.render.to_lowercase();
-    let force_static = render_opt == "off" || render_opt == "no" || render_opt == "false";
-    let force_render = render_opt == "on" || render_opt == "yes" || render_opt == "true";
-
     // ── Determine crawl mode ──────────────────────────────────────────
     // If the user didn't explicitly choose, fetch the first page and
     // analyse it to decide whether headless-browser rendering is needed.
-    let use_render = if force_render {
-        true
-    } else if force_static {
-        false
-    } else {
-        // Auto-detect
-        eprintln!("info: Detecting site type...");
-        let is_spa = crawler::detect_spa(&url).await;
-        if is_spa {
-            eprintln!("info: SPA detected (React/Vue/Angular) — switching to render mode");
-        } else {
-            eprintln!("info: Static site detected — plain HTTP crawl");
+    let use_render = match args.render {
+        RenderMode::On => true,
+        RenderMode::Off => false,
+        RenderMode::Auto => {
+            // Auto-detect
+            eprintln!("info: Detecting site type...");
+            let is_spa = crawler::detect_spa(&url).await;
+            if is_spa {
+                eprintln!("info: SPA detected (React/Vue/Angular) — switching to render mode");
+            } else {
+                eprintln!("info: Static site detected — plain HTTP crawl");
+            }
+            is_spa
         }
-        is_spa
     };
 
     // Verify render support is compiled in
@@ -180,10 +175,6 @@ async fn main() {
     println!("Mirroring: {}", url);
     println!("Output:    {}/", output_dir);
     println!("Workers:   {}", args.jobs);
-    println!("Max pages: {}", args.max_pages);
-    if args.max_bytes > 0 {
-        println!("Max bytes: {}", args.max_bytes);
-    }
     if use_render {
         println!("Mode:      SPA render (headless browser)");
         if args.no_sandbox {
@@ -208,7 +199,7 @@ async fn main() {
             crawler::crawl_spa(
                 &url,
                 &output_dir,
-                args.jobs,
+                args.jobs as usize,
                 manifest,
                 args.robots,
                 args.wait,
@@ -223,7 +214,15 @@ async fn main() {
             Err(anyhow::anyhow!("render feature not enabled"))
         }
     } else {
-        crawler::crawl(&url, &output_dir, args.jobs, manifest, args.robots, limits).await
+        crawler::crawl(
+            &url,
+            &output_dir,
+            args.jobs as usize,
+            manifest,
+            args.robots,
+            limits,
+        )
+        .await
     };
 
     match crawl_result {

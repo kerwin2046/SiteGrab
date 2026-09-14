@@ -28,6 +28,7 @@ mime_guess = "2"
 regex = "1"
 sha2 = "0.10"
 hex = "0.4"
+encoding_rs = "0.8"
 
 # Optional: headless browser for SPA rendering
 chromiumoxide = { version = "0.7", default-features = false, features = ["tokio-runtime"], optional = true }
